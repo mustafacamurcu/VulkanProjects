@@ -22,6 +22,7 @@
 #include <random>
 
 #include "imgui/imgui.h"
+#include "imgui/backends/imgui_impl_glfw.h"
 #include "imgui/backends/imgui_impl_vulkan.h"
 
 const uint32_t WIDTH = 1920;
@@ -87,17 +88,32 @@ PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
       void run() {
         initWindow();
         initVulkan();
+        initImGui();
+
+        ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
         while (!glfwWindowShouldClose(window)) {
           glfwPollEvents();
           processInput(window);
-          drawFrame();
+
+          ImGui_ImplVulkan_NewFrame();
+          ImGui_ImplGlfw_NewFrame();
+          ImGui::NewFrame();
+          ImGui::Begin("Another Window");
+          ImGui::Text("Hello from another window!");
+          ImGui::End();
+          ImGui::Render();
+          ImDrawData* draw_data = ImGui::GetDrawData();
+
+          drawFrame(draw_data);
+
+
         }
 
         cleanup();
         device.waitIdle();
       }
 
-      void drawFrame() {
+      void drawFrame(ImDrawData* draw_data) {
         FrameData& fd = frameDatas[currentFrame];
         auto _ = device.waitForFences({fd.inFlightFence}, VK_TRUE, UINT64_MAX);
 
@@ -120,7 +136,7 @@ PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
 
         updatePushConstants(fd);
 
-        recordCommandBuffer(fd.commandBuffer, fd.imageIndex, currentFrame);
+        recordCommandBuffer(fd.commandBuffer, fd.imageIndex, currentFrame, draw_data);
 
         updateWaves(fd);
 
@@ -310,7 +326,7 @@ PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
         glfwSetWindowUserPointer(window, this);
         glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
         glfwSetCursorPosCallback(window, mouseCallback);
-        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
         return window;
       }
@@ -953,7 +969,8 @@ PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
       }
 
       void recordCommandBuffer(vk::raii::CommandBuffer& commandBuffer,
-                               uint32_t imageIndex, uint32_t currentFrame) {
+                               uint32_t imageIndex, uint32_t currentFrame,
+                               ImDrawData* draw_data) {
         commandBuffer.begin({});
 
         vk::Rect2D renderArea({{0, 0}, swapChainExtent});
@@ -986,15 +1003,30 @@ PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
 
         commandBuffer.drawMeshTasksEXT(1,1,1);
 
+        ImGui_ImplVulkan_RenderDrawData(draw_data, *commandBuffer);
+
         commandBuffer.endRenderPass();
         commandBuffer.end();
       }
 
       void createDescriptorPool() {
-        vk::DescriptorPoolSize poolsize(
-            {vk::DescriptorType::eUniformBuffer, MAX_FRAMES_IN_FLIGHT});
+        // Lots of pool size for imgui
+        vk::DescriptorPoolSize poolsize[] = {
+            //{vk::DescriptorType::eUniformBuffer, MAX_FRAMES_IN_FLIGHT},
+            {vk::DescriptorType::eSampler, 1000},
+            {vk::DescriptorType::eCombinedImageSampler, 1000},
+            {vk::DescriptorType::eSampledImage, 1000},
+            {vk::DescriptorType::eStorageImage, 1000},
+            {vk::DescriptorType::eUniformTexelBuffer, 1000},
+            {vk::DescriptorType::eStorageTexelBuffer, 1000},
+            {vk::DescriptorType::eUniformBuffer, 1000},
+            {vk::DescriptorType::eStorageBuffer, 1000},
+            {vk::DescriptorType::eUniformBufferDynamic, 1000},
+            {vk::DescriptorType::eStorageBufferDynamic, 1000},
+            {vk::DescriptorType::eInputAttachment, 1000},
+        };
         descriptorPool = device.createDescriptorPool(
-            {{vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet}, MAX_FRAMES_IN_FLIGHT, poolsize});
+            {{vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet}, 1000, poolsize});
       }
 
       void createFrameData() {
@@ -1031,6 +1063,49 @@ PFN_vkDestroyDebugUtilsMessengerEXT pfnVkDestroyDebugUtilsMessengerEXT;
                                {}, std::move(descriptorSets[i])});
           frameDatas.push_back(std::move(frameData));
         }
+      }
+
+      void initImGui() {
+        //vk::raii::DescriptorPool pool_sizes[] = {
+        //  {VK_DESCRIPTOR_TYPE_SAMPLER, 1000},
+        //  {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+        //  {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1000},
+        //  {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1000},
+        //  {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 1000},
+        //  {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1000},
+        //  {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1000},
+        //  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1000},
+        //  {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
+        //  {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
+        //  {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1000}};
+        //VkDescriptorPoolCreateInfo pool_info = {};
+        //pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        //pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        //pool_info.maxSets = 1000;
+        //pool_info.poolSizeCount = std::size(pool_sizes);
+        //pool_info.pPoolSizes = pool_sizes;
+
+        //VkDescriptorPool imguiPool;
+        //vkCreateDescriptorPool(*device, &pool_info, nullptr, &imguiPool);
+
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        ImGui::StyleColorsDark();
+        ImGui_ImplGlfw_InitForVulkan(window, true);
+        ImGui_ImplVulkan_InitInfo init_info = {};
+        init_info.ApiVersion = VK_API_VERSION_1_3;
+        init_info.Instance = *instance;
+        init_info.RenderPass = *renderPass;
+        init_info.PhysicalDevice = *physicalDevice;
+        init_info.Device = *device;
+        init_info.Queue = *graphicsQueue;
+        init_info.DescriptorPool = *descriptorPool;
+        init_info.Subpass = 0;
+        init_info.MinImageCount = 2;
+        init_info.ImageCount = 2;
+        init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        ImGui_ImplVulkan_Init(&init_info);
       }
 
       void initVulkan() {
