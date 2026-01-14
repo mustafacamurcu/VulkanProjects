@@ -26,12 +26,65 @@ void Engine::createWaterPipeline() {
 Engine::Engine() {
   createWindow(WIDTH, HEIGHT, "Vulkan Scene");
   volkan_.init(window_);
-  createWaterPipeline();
+  createRayTracingResources();
+  // createWaterPipeline(); // Not used for ray tracing
+}
+
+void Engine::createRayTracingResources() {
+  // Create triangle geometry
+  std::vector<Vertex> vertices = {
+    {0.0f, -0.5f, 0.0f},  // Bottom
+    {0.5f, 0.5f, 0.0f},   // Top right
+    {-0.5f, 0.5f, 0.0f}   // Top left
+  };
+
+  vk::DeviceSize bufferSize = sizeof(Vertex) * vertices.size();
+
+  triangleVertexBuffer_ = volkan_.createBuffer(
+    bufferSize,
+    vk::BufferUsageFlagBits::eVertexBuffer |
+    vk::BufferUsageFlagBits::eShaderDeviceAddress |
+    vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR,
+    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+  );
+
+  void* data = triangleVertexBuffer_.memory.mapMemory(0, bufferSize);
+  memcpy(data, vertices.data(), bufferSize);
+  triangleVertexBuffer_.memory.unmapMemory();
+
+  // Get vertex buffer device address
+  vk::BufferDeviceAddressInfo addressInfo;
+  addressInfo.setBuffer(*triangleVertexBuffer_.buffer);
+  vk::DeviceAddress vertexAddress = volkan_.device_.getBufferAddress(addressInfo);
+
+  // Create BLAS
+  blas_ = volkan_.createBLAS(blasBuffer_, vertexAddress, vertices.size());
+
+  // Create TLAS
+  tlas_ = volkan_.createTLAS(tlasBuffer_, blas_);
+
+  // Create ray tracing material
+  rtMaterial_ = std::make_unique<RayTracingMaterial>(volkan_, tlas_, volkan_.storageImageView_);
 }
 
 Engine::~Engine() {
+  // Wait for all GPU operations to complete before cleanup
+  volkan_.device_.waitIdle();
+
+  // Clean up materials first
+  rtMaterial_.reset();
   waterMaterial_.reset();
+
+  // Clean up ray tracing resources
+  tlas_ = nullptr;
+  tlasBuffer_ = BufferData();
+  blas_ = nullptr;
+  blasBuffer_ = BufferData();
+  triangleVertexBuffer_ = BufferData();
+
+  // Clean up Volkan resources
   volkan_.cleanupRenderResources();
+
   glfwDestroyWindow(window_);
   glfwTerminate();
 }
@@ -58,9 +111,18 @@ void Engine::drawFrame() {
   }
 
   volkan_.beginCommandBuffer();
-  volkan_.beginRenderPass();
-  volkan_.bindPipeline(camera_, time, *waterMaterial_);
-  volkan_.drawMesh();
+
+  // Ray tracing path
+  auto& frameData = volkan_.frameDatas_[volkan_.currentFrame_];
+  rtMaterial_->traceRays(frameData.commandBuffer, volkan_.swapChainExtent_.width,
+                         volkan_.swapChainExtent_.height, volkan_, volkan_.currentFrame_);
+  volkan_.copyStorageImageToSwapchain();
+
+  // Old rasterization path (commented out)
+  // volkan_.beginRenderPass();
+  // volkan_.bindPipeline(camera_, time, *waterMaterial_);
+  // volkan_.drawMesh();
+
   volkan_.submit();
 
 }

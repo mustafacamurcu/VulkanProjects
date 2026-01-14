@@ -109,6 +109,7 @@ void Volkan::init(GLFWwindow* window) {
   createFramebuffers();
   createDescriptorPool();
   createFrameData();
+  createStorageImage();
 }
 
 void Volkan::createInstance() {
@@ -176,14 +177,26 @@ void Volkan::createLogicalDevice() {
   }
 
   vk::PhysicalDeviceFeatures deviceFeatures{};
-  vk::PhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures;
-  meshShaderFeatures.setTaskShader(true);
-  meshShaderFeatures.setMeshShader(true);
+  // vk::PhysicalDeviceMeshShaderFeaturesEXT meshShaderFeatures;
+  // meshShaderFeatures.setTaskShader(true);
+  // meshShaderFeatures.setMeshShader(true);
+
+  // Ray tracing features
+  vk::PhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures;
+  bufferDeviceAddressFeatures.setBufferDeviceAddress(true);
+
+  vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructureFeatures;
+  accelerationStructureFeatures.setAccelerationStructure(true);
+  accelerationStructureFeatures.setPNext(&bufferDeviceAddressFeatures);
+
+  vk::PhysicalDeviceRayTracingPipelineFeaturesKHR rayTracingPipelineFeatures;
+  rayTracingPipelineFeatures.setRayTracingPipeline(true);
+  rayTracingPipelineFeatures.setPNext(&accelerationStructureFeatures);
 
   vk::DeviceCreateInfo deviceCI;
   deviceCI.setQueueCreateInfos(queueCreateInfos);
   deviceCI.setPEnabledFeatures(&deviceFeatures);
-  deviceCI.setPNext(&meshShaderFeatures);
+  deviceCI.setPNext(&rayTracingPipelineFeatures);
   deviceCI.setPEnabledExtensionNames(extensions_);
 #ifndef NDEBUG
   const std::vector<const char*>layer_names = {KHRONOS_VALIDATION_LAYER};
@@ -231,7 +244,7 @@ void Volkan::createSwapChain() {
   swapchainCI.setImageColorSpace(surfaceFormat.colorSpace);
   swapchainCI.setImageExtent(extent);
   swapchainCI.setImageArrayLayers(1);
-  swapchainCI.setImageUsage(vk::ImageUsageFlagBits::eColorAttachment);
+  swapchainCI.setImageUsage(vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst);
   swapchainCI.setImageSharingMode(imageSharingMode);
   swapchainCI.setPQueueFamilyIndices(queueFamilyIndices);
   swapchainCI.setQueueFamilyIndexCount(2);
@@ -310,8 +323,8 @@ void Volkan::createRenderPass() {
   renderPass_ = device_.createRenderPass(renderPassCreateInfo);
 }
 
-vk::raii::DescriptorSetLayout Volkan::createDescriptorSetLayout(vk::DescriptorSetLayoutBinding layoutBinding) {
-  return device_.createDescriptorSetLayout({{}, layoutBinding});
+vk::raii::DescriptorSetLayout Volkan::createDescriptorSetLayout(vk::DescriptorSetLayoutCreateInfo layoutInfo) {
+  return device_.createDescriptorSetLayout(layoutInfo);
 }
 
 vk::raii::DescriptorSets Volkan::createDescriptorSets(
@@ -449,11 +462,17 @@ BufferData Volkan::createBuffer(vk::DeviceSize bufferSize, vk::BufferUsageFlags 
   vk::MemoryRequirements memRequirements = buffer.getMemoryRequirements();
 
   uint32_t memoryType =
-      findMemoryType(memRequirements.memoryTypeBits,
-                     vk::MemoryPropertyFlagBits::eHostVisible |
-                         vk::MemoryPropertyFlagBits::eHostCoherent, physicalDevice_);
+      findMemoryType(memRequirements.memoryTypeBits, properties, physicalDevice_);
 
-  vk::raii::DeviceMemory memory(device_, {memRequirements.size, memoryType});
+  // Check if buffer needs device address
+  vk::MemoryAllocateInfo allocInfo(memRequirements.size, memoryType);
+  vk::MemoryAllocateFlagsInfo allocFlagsInfo;
+  if (usage & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+    allocFlagsInfo.setFlags(vk::MemoryAllocateFlagBits::eDeviceAddress);
+    allocInfo.setPNext(&allocFlagsInfo);
+  }
+
+  vk::raii::DeviceMemory memory(device_, allocInfo);
 
   buffer.bindMemory(memory, 0);
 
@@ -590,8 +609,8 @@ void Volkan::submit() {
   auto& commandBuffer = fd.commandBuffer;
   vk::PipelineStageFlags waitDestinationStageMask(
       vk::PipelineStageFlagBits::eColorAttachmentOutput);
-  
-  commandBuffer.endRenderPass();
+
+  // commandBuffer.endRenderPass(); // Not used for ray tracing
   commandBuffer.end();
 
   vk::SubmitInfo submitInfo(*fd.imageAvailableSemaphore,
@@ -627,8 +646,380 @@ vk::raii::Pipeline Volkan::createPipeline(vk::GraphicsPipelineCreateInfo gpci) {
   return device_.createGraphicsPipeline(nullptr, gpci);
 }
 
+void Volkan::copyStorageImageToSwapchain() {
+  FrameData& fd = frameDatas_[currentFrame_];
+  auto& commandBuffer = fd.commandBuffer;
+
+  // Transition storage image to transfer source
+  vk::ImageMemoryBarrier storageBarrier;
+  storageBarrier.setOldLayout(vk::ImageLayout::eGeneral);
+  storageBarrier.setNewLayout(vk::ImageLayout::eTransferSrcOptimal);
+  storageBarrier.setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  storageBarrier.setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  storageBarrier.setImage(*storageImage_);
+  storageBarrier.setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+  storageBarrier.setSrcAccessMask(vk::AccessFlagBits::eShaderWrite);
+  storageBarrier.setDstAccessMask(vk::AccessFlagBits::eTransferRead);
+
+  commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+    vk::PipelineStageFlagBits::eTransfer,
+    {}, {}, {}, storageBarrier
+  );
+
+  // Transition swapchain image to transfer destination
+  vk::ImageMemoryBarrier swapchainBarrier;
+  swapchainBarrier.setOldLayout(vk::ImageLayout::eUndefined);
+  swapchainBarrier.setNewLayout(vk::ImageLayout::eTransferDstOptimal);
+  swapchainBarrier.setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  swapchainBarrier.setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  swapchainBarrier.setImage(swapChainImages_[fd.imageIndex]);
+  swapchainBarrier.setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+  swapchainBarrier.setSrcAccessMask(vk::AccessFlagBits::eNone);
+  swapchainBarrier.setDstAccessMask(vk::AccessFlagBits::eTransferWrite);
+
+  commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eTopOfPipe,
+    vk::PipelineStageFlagBits::eTransfer,
+    {}, {}, {}, swapchainBarrier
+  );
+
+  // Copy storage image to swapchain
+  vk::ImageCopy copyRegion;
+  copyRegion.setSrcSubresource({vk::ImageAspectFlagBits::eColor, 0, 0, 1});
+  copyRegion.setSrcOffset({0, 0, 0});
+  copyRegion.setDstSubresource({vk::ImageAspectFlagBits::eColor, 0, 0, 1});
+  copyRegion.setDstOffset({0, 0, 0});
+  copyRegion.setExtent({swapChainExtent_.width, swapChainExtent_.height, 1});
+
+  commandBuffer.copyImage(*storageImage_, vk::ImageLayout::eTransferSrcOptimal,
+                          swapChainImages_[fd.imageIndex], vk::ImageLayout::eTransferDstOptimal,
+                          copyRegion);
+
+  // Transition swapchain image to present
+  vk::ImageMemoryBarrier presentBarrier;
+  presentBarrier.setOldLayout(vk::ImageLayout::eTransferDstOptimal);
+  presentBarrier.setNewLayout(vk::ImageLayout::ePresentSrcKHR);
+  presentBarrier.setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  presentBarrier.setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  presentBarrier.setImage(swapChainImages_[fd.imageIndex]);
+  presentBarrier.setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+  presentBarrier.setSrcAccessMask(vk::AccessFlagBits::eTransferWrite);
+  presentBarrier.setDstAccessMask(vk::AccessFlagBits::eNone);
+
+  commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eTransfer,
+    vk::PipelineStageFlagBits::eBottomOfPipe,
+    {}, {}, {}, presentBarrier
+  );
+
+  // Transition storage image back to general
+  vk::ImageMemoryBarrier storageBackBarrier;
+  storageBackBarrier.setOldLayout(vk::ImageLayout::eTransferSrcOptimal);
+  storageBackBarrier.setNewLayout(vk::ImageLayout::eGeneral);
+  storageBackBarrier.setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  storageBackBarrier.setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  storageBackBarrier.setImage(*storageImage_);
+  storageBackBarrier.setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+  storageBackBarrier.setSrcAccessMask(vk::AccessFlagBits::eTransferRead);
+  storageBackBarrier.setDstAccessMask(vk::AccessFlagBits::eShaderWrite);
+
+  commandBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eTransfer,
+    vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+    {}, {}, {}, storageBackBarrier
+  );
+}
+
+// Ray tracing helper implementations
+vk::raii::CommandBuffer Volkan::beginSingleTimeCommands() {
+  vk::raii::CommandBuffer cmdBuffer = std::move(
+    vk::raii::CommandBuffers(device_, {commandPool_, vk::CommandBufferLevel::ePrimary, 1})[0]
+  );
+  cmdBuffer.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+  return cmdBuffer;
+}
+
+void Volkan::endSingleTimeCommands(vk::raii::CommandBuffer& cmdBuffer) {
+  cmdBuffer.end();
+  vk::SubmitInfo submitInfo;
+  submitInfo.setCommandBuffers(*cmdBuffer);
+  graphicsQueue_.submit(submitInfo, nullptr);
+  graphicsQueue_.waitIdle();
+}
+
+vk::raii::AccelerationStructureKHR Volkan::createBLAS(BufferData& blasBuffer,
+                                                       vk::DeviceAddress vertexBufferAddress,
+                                                       uint32_t vertexCount) {
+
+  // Setup geometry
+  vk::AccelerationStructureGeometryTrianglesDataKHR triangles;
+  triangles.setVertexFormat(vk::Format::eR32G32B32Sfloat);
+  triangles.setVertexData(vertexBufferAddress);
+  triangles.setVertexStride(sizeof(float) * 3);
+  triangles.setMaxVertex(vertexCount - 1);
+  triangles.setIndexType(vk::IndexType::eNoneKHR);
+
+  vk::AccelerationStructureGeometryKHR geometry;
+  geometry.setGeometryType(vk::GeometryTypeKHR::eTriangles);
+  geometry.setGeometry({triangles});
+  geometry.setFlags(vk::GeometryFlagBitsKHR::eOpaque);
+
+  vk::AccelerationStructureBuildGeometryInfoKHR buildInfo;
+  buildInfo.setType(vk::AccelerationStructureTypeKHR::eBottomLevel);
+  buildInfo.setFlags(vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
+  buildInfo.setGeometries(geometry);
+
+  uint32_t primitiveCount = 1;
+
+  vk::AccelerationStructureBuildSizesInfoKHR sizeInfo =
+    device_.getAccelerationStructureBuildSizesKHR(
+      vk::AccelerationStructureBuildTypeKHR::eDevice,
+      buildInfo,
+      primitiveCount
+    );
+
+  // Create BLAS buffer (caller provides)
+  blasBuffer = createBuffer(
+    sizeInfo.accelerationStructureSize,
+    vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+    vk::MemoryPropertyFlagBits::eDeviceLocal
+  );
+
+  // Create BLAS
+  vk::AccelerationStructureCreateInfoKHR createInfo;
+  createInfo.setBuffer(*blasBuffer.buffer);
+  createInfo.setSize(sizeInfo.accelerationStructureSize);
+  createInfo.setType(vk::AccelerationStructureTypeKHR::eBottomLevel);
+  vk::raii::AccelerationStructureKHR blas = device_.createAccelerationStructureKHR(createInfo);
+
+  // Create scratch buffer
+  BufferData scratchBuffer = createBuffer(
+    sizeInfo.buildScratchSize,
+    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+    vk::MemoryPropertyFlagBits::eDeviceLocal
+  );
+
+  vk::BufferDeviceAddressInfo scratchAddressInfo;
+  scratchAddressInfo.setBuffer(*scratchBuffer.buffer);
+  vk::DeviceAddress scratchAddress = device_.getBufferAddress(scratchAddressInfo);
+
+  // Build BLAS
+  buildInfo.setMode(vk::BuildAccelerationStructureModeKHR::eBuild);
+  buildInfo.setDstAccelerationStructure(*blas);
+  buildInfo.setScratchData(scratchAddress);
+
+  vk::AccelerationStructureBuildRangeInfoKHR rangeInfo;
+  rangeInfo.setPrimitiveCount(primitiveCount);
+  rangeInfo.setPrimitiveOffset(0);
+  rangeInfo.setFirstVertex(0);
+  rangeInfo.setTransformOffset(0);
+
+  // Build on GPU
+  vk::raii::CommandBuffer cmdBuffer = beginSingleTimeCommands();
+  cmdBuffer.buildAccelerationStructuresKHR(buildInfo, &rangeInfo);
+  endSingleTimeCommands(cmdBuffer);
+
+  return blas;
+}
+
+vk::raii::AccelerationStructureKHR Volkan::createTLAS(BufferData& tlasBuffer,
+                                                       vk::raii::AccelerationStructureKHR& blas) {
+  // Get BLAS device address
+  vk::AccelerationStructureDeviceAddressInfoKHR blasAddressInfo;
+  blasAddressInfo.setAccelerationStructure(*blas);
+  vk::DeviceAddress blasAddress = device_.getAccelerationStructureAddressKHR(blasAddressInfo);
+
+  // Create instance buffer
+  vk::TransformMatrixKHR transform;
+  transform.matrix[0][0] = 1.0f; transform.matrix[0][1] = 0.0f; transform.matrix[0][2] = 0.0f; transform.matrix[0][3] = 0.0f;
+  transform.matrix[1][0] = 0.0f; transform.matrix[1][1] = 1.0f; transform.matrix[1][2] = 0.0f; transform.matrix[1][3] = 0.0f;
+  transform.matrix[2][0] = 0.0f; transform.matrix[2][1] = 0.0f; transform.matrix[2][2] = 1.0f; transform.matrix[2][3] = 0.0f;
+
+  vk::AccelerationStructureInstanceKHR instance;
+  instance.setTransform(transform);
+  instance.setInstanceCustomIndex(0);
+  instance.setMask(0xFF);
+  instance.setInstanceShaderBindingTableRecordOffset(0);
+  instance.setFlags(vk::GeometryInstanceFlagBitsKHR::eTriangleFacingCullDisable);
+  instance.setAccelerationStructureReference(blasAddress);
+
+  BufferData instanceBuffer = createBuffer(
+    sizeof(vk::AccelerationStructureInstanceKHR),
+    vk::BufferUsageFlagBits::eShaderDeviceAddress |
+    vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR,
+    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent
+  );
+
+  void* data = instanceBuffer.memory.mapMemory(0, sizeof(vk::AccelerationStructureInstanceKHR));
+  memcpy(data, &instance, sizeof(vk::AccelerationStructureInstanceKHR));
+  instanceBuffer.memory.unmapMemory();
+
+  vk::BufferDeviceAddressInfo instanceAddressInfo;
+  instanceAddressInfo.setBuffer(*instanceBuffer.buffer);
+  vk::DeviceAddress instanceAddress = device_.getBufferAddress(instanceAddressInfo);
+
+  // Setup TLAS geometry
+  vk::AccelerationStructureGeometryInstancesDataKHR instancesData;
+  instancesData.setArrayOfPointers(false);
+  instancesData.setData(instanceAddress);
+
+  vk::AccelerationStructureGeometryKHR geometry;
+  geometry.setGeometryType(vk::GeometryTypeKHR::eInstances);
+  geometry.setGeometry({instancesData});
+
+  vk::AccelerationStructureBuildGeometryInfoKHR buildInfo;
+  buildInfo.setType(vk::AccelerationStructureTypeKHR::eTopLevel);
+  buildInfo.setFlags(vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace);
+  buildInfo.setGeometries(geometry);
+
+  uint32_t primitiveCount = 1;
+
+  vk::AccelerationStructureBuildSizesInfoKHR sizeInfo =
+    device_.getAccelerationStructureBuildSizesKHR(
+      vk::AccelerationStructureBuildTypeKHR::eDevice,
+      buildInfo,
+      primitiveCount
+    );
+
+  // Create TLAS buffer (caller provides)
+  tlasBuffer = createBuffer(
+    sizeInfo.accelerationStructureSize,
+    vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+    vk::MemoryPropertyFlagBits::eDeviceLocal
+  );
+
+  // Create TLAS
+  vk::AccelerationStructureCreateInfoKHR createInfo;
+  createInfo.setBuffer(*tlasBuffer.buffer);
+  createInfo.setSize(sizeInfo.accelerationStructureSize);
+  createInfo.setType(vk::AccelerationStructureTypeKHR::eTopLevel);
+  vk::raii::AccelerationStructureKHR tlas = device_.createAccelerationStructureKHR(createInfo);
+
+  // Create scratch buffer
+  BufferData scratchBuffer = createBuffer(
+    sizeInfo.buildScratchSize,
+    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+    vk::MemoryPropertyFlagBits::eDeviceLocal
+  );
+
+  vk::BufferDeviceAddressInfo scratchAddressInfo;
+  scratchAddressInfo.setBuffer(*scratchBuffer.buffer);
+  vk::DeviceAddress scratchAddress = device_.getBufferAddress(scratchAddressInfo);
+
+  // Build TLAS
+  buildInfo.setMode(vk::BuildAccelerationStructureModeKHR::eBuild);
+  buildInfo.setDstAccelerationStructure(*tlas);
+  buildInfo.setScratchData(scratchAddress);
+
+  vk::AccelerationStructureBuildRangeInfoKHR rangeInfo;
+  rangeInfo.setPrimitiveCount(primitiveCount);
+  rangeInfo.setPrimitiveOffset(0);
+  rangeInfo.setFirstVertex(0);
+  rangeInfo.setTransformOffset(0);
+
+  // Build on GPU
+  vk::raii::CommandBuffer cmdBuffer = beginSingleTimeCommands();
+  cmdBuffer.buildAccelerationStructuresKHR(buildInfo, &rangeInfo);
+  endSingleTimeCommands(cmdBuffer);
+
+  return tlas;
+}
+
+void Volkan::createStorageImage() {
+  vk::ImageCreateInfo imageInfo;
+  imageInfo.setImageType(vk::ImageType::e2D);
+  imageInfo.setFormat(vk::Format::eR8G8B8A8Unorm);
+  imageInfo.setExtent({swapChainExtent_.width, swapChainExtent_.height, 1});
+  imageInfo.setMipLevels(1);
+  imageInfo.setArrayLayers(1);
+  imageInfo.setSamples(vk::SampleCountFlagBits::e1);
+  imageInfo.setTiling(vk::ImageTiling::eOptimal);
+  imageInfo.setUsage(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc);
+  imageInfo.setInitialLayout(vk::ImageLayout::eUndefined);
+
+  storageImage_ = device_.createImage(imageInfo);
+
+  vk::MemoryRequirements memReqs = storageImage_.getMemoryRequirements();
+  storageImageMemory_ = device_.allocateMemory({
+    memReqs.size,
+    findMemoryType(memReqs.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal, physicalDevice_)
+  });
+
+  storageImage_.bindMemory(*storageImageMemory_, 0);
+
+  vk::ImageViewCreateInfo viewInfo;
+  viewInfo.setImage(*storageImage_);
+  viewInfo.setViewType(vk::ImageViewType::e2D);
+  viewInfo.setFormat(vk::Format::eR8G8B8A8Unorm);
+  viewInfo.setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+
+  storageImageView_ = device_.createImageView(viewInfo);
+
+  // Transition to general layout
+  vk::raii::CommandBuffer cmdBuffer = std::move(
+    vk::raii::CommandBuffers(device_, {commandPool_, vk::CommandBufferLevel::ePrimary, 1})[0]
+  );
+
+  cmdBuffer.begin({vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+  vk::ImageMemoryBarrier barrier;
+  barrier.setOldLayout(vk::ImageLayout::eUndefined);
+  barrier.setNewLayout(vk::ImageLayout::eGeneral);
+  barrier.setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  barrier.setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED);
+  barrier.setImage(*storageImage_);
+  barrier.setSubresourceRange({vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1});
+  barrier.setSrcAccessMask(vk::AccessFlagBits::eNone);
+  barrier.setDstAccessMask(vk::AccessFlagBits::eShaderWrite);
+
+  cmdBuffer.pipelineBarrier(
+    vk::PipelineStageFlagBits::eTopOfPipe,
+    vk::PipelineStageFlagBits::eRayTracingShaderKHR,
+    {}, {}, {}, barrier
+  );
+
+  cmdBuffer.end();
+
+  vk::SubmitInfo submitInfo;
+  submitInfo.setCommandBuffers(*cmdBuffer);
+  graphicsQueue_.submit(submitInfo, nullptr);
+  graphicsQueue_.waitIdle();
+}
+
+vk::raii::Pipeline Volkan::createRayTracingPipeline(vk::RayTracingPipelineCreateInfoKHR pipelineInfo) {
+  return device_.createRayTracingPipelineKHR(nullptr, nullptr, pipelineInfo);
+}
+
+vk::PhysicalDeviceRayTracingPipelinePropertiesKHR Volkan::getRayTracingProperties() {
+  vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceRayTracingPipelinePropertiesKHR> props;
+  props = physicalDevice_.getProperties2<vk::PhysicalDeviceProperties2,vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
+  return props.get<vk::PhysicalDeviceRayTracingPipelinePropertiesKHR>();
+}
+
 void Volkan::cleanupRenderResources() {
+    // Clean up frame data (command buffers and sync objects) first
+    frameDatas_.clear();
+
     // Destroy framebuffers and render pass before device destruction
     swapChainFramebuffers_.clear();
     renderPass_ = nullptr;
+
+    // Clean up ray tracing storage image
+    storageImageView_ = nullptr;
+    storageImage_ = nullptr;
+    storageImageMemory_ = nullptr;
+
+    // Clean up swapchain resources
+    swapChainImageViews_.clear();
+    swapChain_ = nullptr;
+
+    // Clean up depth resources
+    depthImageView_ = nullptr;
+    depthImage_ = nullptr;
+    depthImageMemory_ = nullptr;
+
+    // Clean up pools after all resources using them are destroyed
+    descriptorPool_ = nullptr;
+    commandPool_ = nullptr;
 }

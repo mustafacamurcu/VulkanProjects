@@ -36,11 +36,24 @@ class Engine {
   void createWindow(int width, int height, const char* title);
 
   void createWaterPipeline();
+  void createRayTracingResources();
 
   void processInput(GLFWwindow* window);
   void drawFrame();
 
   std::unique_ptr<Material> waterMaterial_;
+  std::unique_ptr<RayTracingMaterial> rtMaterial_;
+
+  // Ray tracing geometry
+  struct Vertex {
+    float x, y, z;
+  };
+  BufferData triangleVertexBuffer_;
+  vk::raii::AccelerationStructureKHR blas_ = nullptr;
+  BufferData blasBuffer_;
+  vk::raii::AccelerationStructureKHR tlas_ = nullptr;
+  BufferData tlasBuffer_;
+
   GLFWwindow* window_;
   Volkan volkan_;
 

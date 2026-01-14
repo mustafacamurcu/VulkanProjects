@@ -5,7 +5,6 @@
 #include "structs.h"
 
 class Volkan;
-struct BufferData;
 
 class Material {
  public:
@@ -39,4 +38,20 @@ class WaterMaterial : public Material {
   WaterMaterial(Volkan& volkan, SpecData specData,
                 vk::raii::RenderPass& renderPass);
  private:
+};
+
+class RayTracingMaterial : public Material {
+ public:
+  RayTracingMaterial(Volkan& volkan,
+                     vk::raii::AccelerationStructureKHR& tlas,
+                     vk::raii::ImageView& storageImageView);
+
+  void traceRays(vk::raii::CommandBuffer& commandBuffer,
+                 uint32_t width, uint32_t height, Volkan& volkan,
+                 size_t currentFrameIndex);
+
+ private:
+  BufferData raygenSBT_;
+  BufferData missSBT_;
+  BufferData hitSBT_;
 };

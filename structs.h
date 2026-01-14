@@ -2,10 +2,25 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <vulkan/vulkan_raii.hpp>
 
 #define NUM_WAVES 10
 
 #define MAX_FRAMES_IN_FLIGHT 2
+
+struct BufferData {
+  vk::raii::Buffer buffer = nullptr;
+  vk::raii::DeviceMemory memory = nullptr;
+  void* mapped = nullptr;
+
+  BufferData(vk::raii::Buffer& _buffer, vk::raii::DeviceMemory& _memory,
+             void* mapped_)
+      : buffer(std::move(_buffer)),
+        memory(std::move(_memory)),
+        mapped(mapped_) {}
+
+  BufferData() : buffer(nullptr), memory(nullptr), mapped(nullptr) {}
+};
 
 struct Camera {
   glm::vec3 pos{50.0, -70.0, -80.0};
